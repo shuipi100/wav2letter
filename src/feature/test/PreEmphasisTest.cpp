@@ -9,9 +9,9 @@
 #include <gtest/gtest.h>
 
 #include "TestUtils.h"
-#include "feature/PreEmphasis.h"
+#include "libraries/feature/PreEmphasis.h"
 
-using speech::PreEmphasis;
+using w2l::PreEmphasis;
 
 // Matlab code used: B=[1, -0.95]; = filter(B, 1, data, [], 2);
 // For first element in data multiply by (1 - alpha)

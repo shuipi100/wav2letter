@@ -13,7 +13,7 @@
 #include <glog/logging.h>
 
 #include "common/Defines.h"
-#include "common/Utils.h"
+#include "common/FlashlightUtils.h"
 
 namespace w2l {
 std::pair<std::string, std::string> getStatus(
@@ -53,12 +53,16 @@ std::pair<std::string, std::string> getStatus(
       "crit-fwd(ms)", format("%.2f", meters.critfwdtimer.value() * 1000));
   insertItem("bwd(ms)", format("%.2f", meters.bwdtimer.value() * 1000));
   insertItem("optim(ms)", format("%.2f", meters.optimtimer.value() * 1000));
-  insertItem("loss", format("%10.5f", meters.loss.value()[0]));
+  insertItem("loss", format("%10.5f", meters.train.loss.value()[0]));
 
-  insertItem("train-" + errtype, format("%5.2f", meters.train.edit.value()[0]));
+  insertItem(
+      "train-" + errtype, format("%5.2f", meters.train.tknEdit.value()[0]));
+  insertItem("train-WER", format("%5.2f", meters.train.wrdEdit.value()[0]));
   for (auto& v : meters.valid) {
+    insertItem(v.first + "-loss", format("%10.5f", v.second.loss.value()[0]));
     insertItem(
-        v.first + "-" + errtype, format("%5.2f", v.second.edit.value()[0]));
+        v.first + "-" + errtype, format("%5.2f", v.second.tknEdit.value()[0]));
+    insertItem(v.first + "-WER", format("%5.2f", v.second.wrdEdit.value()[0]));
   }
   auto stats = meters.stats.value();
   auto numsamples = std::max<int64_t>(stats[4], 1);
@@ -71,7 +75,7 @@ std::pair<std::string, std::string> getStatus(
 
   double audioProcSec = isztotal * FLAGS_batchsize;
   if (FLAGS_pow || FLAGS_mfcc || FLAGS_mfsc) {
-    audioProcSec = audioProcSec * kFrameStrideMs / 1000.0;
+    audioProcSec = audioProcSec * FLAGS_framestridems / 1000.0;
   } else {
     audioProcSec /= FLAGS_samplerate;
   }
@@ -180,7 +184,6 @@ void allreduceSet(fl::TimeMeter& mtr, af::array& val) {
 
 template <>
 void syncMeter<TrainMeters>(TrainMeters& mtrs) {
-  syncMeter(mtrs.loss);
   syncMeter(mtrs.stats);
   syncMeter(mtrs.runtime);
   syncMeter(mtrs.timer);
@@ -188,11 +191,13 @@ void syncMeter<TrainMeters>(TrainMeters& mtrs) {
   syncMeter(mtrs.critfwdtimer);
   syncMeter(mtrs.bwdtimer);
   syncMeter(mtrs.optimtimer);
-  syncMeter(mtrs.train.edit);
-  syncMeter(mtrs.train.wordedit);
+  syncMeter(mtrs.train.tknEdit);
+  syncMeter(mtrs.train.wrdEdit);
+  syncMeter(mtrs.train.loss);
   for (auto& v : mtrs.valid) {
-    syncMeter(v.second.edit);
-    syncMeter(v.second.wordedit);
+    syncMeter(v.second.tknEdit);
+    syncMeter(v.second.wrdEdit);
+    syncMeter(v.second.loss);
   }
 }
 

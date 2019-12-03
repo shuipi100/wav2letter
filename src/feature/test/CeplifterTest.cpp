@@ -9,9 +9,9 @@
 #include <gtest/gtest.h>
 
 #include "TestUtils.h"
-#include "feature/Ceplifter.h"
+#include "libraries/feature/Ceplifter.h"
 
-using speech::Ceplifter;
+using w2l::Ceplifter;
 
 // matlab code used:
 // ceplifter = @( N, L )( 1+0.5*L*sin(pi*[0:N-1]/L) );

@@ -6,45 +6,43 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <sstream>
 
 #include "TestUtils.h"
-#include "common/Utils.h"
-#include "feature/FeatureParams.h"
-#include "feature/Mfcc.h"
-#include "feature/Sound.h"
+#include "common/FlashlightUtils.h"
+#include "libraries/feature/FeatureParams.h"
+#include "libraries/feature/Mfcc.h"
 
 namespace {
 std::string loadPath = "";
-}
 
-using namespace speech;
+auto loadData = [](const std::string& filepath) {
+  std::vector<float> data;
+  std::ifstream file(filepath);
+  std::istream_iterator<float> eos;
+  std::istream_iterator<float> iit(file);
+  std::copy(iit, eos, std::back_inserter(data));
+  return data;
+};
+} // namespace
+
+using namespace w2l;
 
 // HTK Code used -
 //    HCopy -C config.mfcc sa1.wav sa1-mfcc.htk
 // Reference : https://labrosa.ee.columbia.edu/matlab/rastamat/mfccs.html
 TEST(MfccTest, htkCompareTest) {
   // read wav data
-  auto wavinput =
-      loadSound<float>(w2l::pathsConcat(loadPath, "sa1.wav").c_str());
-  ASSERT_TRUE(wavinput.size() > 0 && "Wavfile not loaded properly!");
+  auto wavinput = loadData(w2l::pathsConcat(loadPath, "sa1.dat"));
+  ASSERT_TRUE(wavinput.size() > 0 && "sa1 frames not loaded properly!");
 
   // read expected output data computed from HTK
-  std::vector<float> htkfeat;
-  std::fstream file(w2l::pathsConcat(loadPath, "sa1-mfcc.htk"));
-  std::string line;
-  while (getline(file, line)) {
-    std::istringstream iss(line);
-    std::copy(
-        std::istream_iterator<float>(iss),
-        std::istream_iterator<float>(),
-        std::back_inserter(htkfeat));
-  }
+  auto htkfeat = loadData(w2l::pathsConcat(loadPath, "sa1-mfcc.htk"));
   // HTK features not read properly!
   ASSERT_TRUE(htkfeat.size() > 0);
   FeatureParams params;
@@ -82,9 +80,9 @@ TEST(MfccTest, htkCompareTest) {
       max = curdiff;
     }
   }
-  LOG(INFO) << "| Max diff across all dimensions " << max << "\n"; // 0.325853
+  std::cerr << "| Max diff across all dimensions " << max << "\n"; // 0.325853
 
-  LOG(INFO) << "| Avg diff across all dimensions " << sum / feat.size()
+  std::cerr << "| Avg diff across all dimensions " << sum / feat.size()
             << "\n"; // 0.00252719
 }
 

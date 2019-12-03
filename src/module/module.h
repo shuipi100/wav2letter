@@ -8,5 +8,7 @@
 
 #pragma once
 
-#include "module/Residual.h"
+#include "module/ConvLmModule.h"
+#include "module/SpecAugment.h"
+#include "module/TDSBlock.h"
 #include "module/W2lModule.h"

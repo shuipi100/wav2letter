@@ -11,9 +11,9 @@
 #include <thread>
 
 #include "TestUtils.h"
-#include "feature/Dither.h"
+#include "libraries/feature/Dither.h"
 
-using speech::Dither;
+using w2l::Dither;
 
 TEST(DitherTest, basicTest) {
   int64_t N = 1000;

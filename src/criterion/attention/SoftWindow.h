@@ -8,7 +8,7 @@
 
 #pragma once
 
-#include "WindowBase.h"
+#include "criterion/attention/WindowBase.h"
 
 namespace w2l {
 

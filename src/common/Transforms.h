@@ -9,59 +9,16 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <numeric>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
-#include <arrayfire.h>
-#include <glog/logging.h>
-
 #include "common/Defines.h"
-#include "common/Dictionary.h"
+#include "libraries/common/Dictionary.h"
 
 namespace w2l {
-
-void replaceReplabels(
-    std::vector<int>& in,
-    int64_t numreps,
-    const Dictionary& dict);
-
-void replaceReplabels(
-    std::vector<int>& in,
-    int64_t numreps,
-    const std::unordered_map<int64_t, int64_t>& repmap);
-
-template <class T>
-void invReplaceReplabels(
-    std::vector<T>& in,
-    const std::unordered_map<int64_t, int64_t>& invrepmap) {
-  if (in.empty()) {
-    return;
-  }
-  std::vector<T> out;
-  out.emplace_back(in[0]);
-  for (size_t i = 1; i < in.size(); ++i) {
-    auto s = invrepmap.find(in[i]);
-    if (s != invrepmap.end()) {
-      out.insert(out.end(), s->second, in[i - 1]);
-    } else {
-      out.emplace_back(in[i]);
-    }
-  }
-  std::swap(in, out);
-}
-
-template <class T>
-void invReplaceReplabels(
-    std::vector<T>& in,
-    int64_t numreps,
-    const Dictionary& dict) {
-  std::unordered_map<int64_t, int64_t> invrepmap;
-  for (int64_t i = 1; i <= numreps; ++i) {
-    invrepmap[dict.getIndex(std::to_string(i))] = i;
-  }
-  invReplaceReplabels(in, invrepmap);
-}
 
 template <class T>
 void uniq(std::vector<T>& in) {
@@ -72,13 +29,6 @@ void uniq(std::vector<T>& in) {
   in.resize(std::distance(in.begin(), it));
 }
 
-std::vector<int> toSingleLtr(
-    const std::vector<int>& labels,
-    const Dictionary& d);
-
-af::array
-pad(const af::array& in, const int size, const int dim = 0, float val = 0.0);
-
 template <class T>
 void remapLabels(std::vector<T>& labels, const Dictionary& dict) {
   if (FLAGS_eostoken) {
@@ -88,7 +38,7 @@ void remapLabels(std::vector<T>& labels, const Dictionary& dict) {
     }
   }
   if (FLAGS_replabel > 0) {
-    invReplaceReplabels(labels, FLAGS_replabel, dict);
+    labels = unpackReplabels(labels, dict, FLAGS_replabel);
   }
   auto trimLabels = [&labels](int idx) {
     if (!labels.empty() && labels.back() == idx) {
@@ -113,7 +63,9 @@ std::vector<T> transpose2d(
     int64_t inRow,
     int64_t inCol,
     int64_t inBatch = 1) {
-  LOG_IF(FATAL, in.size() != inRow * inCol * inBatch);
+  if (in.size() != inRow * inCol * inBatch) {
+    throw std::invalid_argument("Invalid input size");
+  }
   std::vector<T> out(in.size());
   for (size_t b = 0; b < inBatch; ++b) {
     int64_t start = b * inRow * inCol;

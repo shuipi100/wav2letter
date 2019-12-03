@@ -12,9 +12,9 @@
 #include <iostream>
 #include <utility>
 
-#include "feature/Mfcc.h"
+#include "libraries/feature/Mfcc.h"
 
-using namespace speech;
+using namespace w2l;
 
 int main() {
   FeatureParams params;

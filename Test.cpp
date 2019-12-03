@@ -16,14 +16,12 @@
 #include <glog/logging.h>
 
 #include "common/Defines.h"
-#include "common/Dictionary.h"
+#include "common/FlashlightUtils.h"
 #include "common/Transforms.h"
-#include "common/Utils.h"
 #include "criterion/criterion.h"
+#include "libraries/common/Dictionary.h"
 #include "module/module.h"
-#include "runtime/Data.h"
-#include "runtime/Logger.h"
-#include "runtime/Serial.h"
+#include "runtime/runtime.h"
 
 using namespace w2l;
 
@@ -35,8 +33,7 @@ int main(int argc, char** argv) {
   for (int i = 0; i < argc; i++) {
     argvs.emplace_back(argv[i]);
   }
-  gflags::SetUsageMessage(
-      "Usage: \n " + exec + " [data_path] [dataset_name] [flags]");
+  gflags::SetUsageMessage("Usage: Please refer to https://git.io/fjVVq");
   if (argc <= 1) {
     LOG(FATAL) << gflags::ProgramUsage();
   }
@@ -79,14 +76,33 @@ int main(int argc, char** argv) {
   LOG(INFO) << "Gflags after parsing \n" << serializeGflags("; ");
 
   /* ===================== Create Dictionary ===================== */
+  auto dictPath = pathsConcat(FLAGS_tokensdir, FLAGS_tokens);
+  if (dictPath.empty() || !fileExists(dictPath)) {
+    throw std::runtime_error("Invalid dictionary filepath specified.");
+  }
+  Dictionary tokenDict(dictPath);
+  // Setup-specific modifications
+  for (int64_t r = 1; r <= FLAGS_replabel; ++r) {
+    tokenDict.addEntry(std::to_string(r));
+  }
+  // ctc expects the blank label last
+  if (FLAGS_criterion == kCtcCriterion) {
+    tokenDict.addEntry(kBlankToken);
+  }
+  if (FLAGS_eostoken) {
+    tokenDict.addEntry(kEosToken);
+  }
 
-  auto tokenDict = createTokenDict(pathsConcat(FLAGS_tokensdir, FLAGS_tokens));
   int numClasses = tokenDict.indexSize();
   LOG(INFO) << "Number of classes (network): " << numClasses;
 
-  auto lexicon = loadWords(FLAGS_lexicon, FLAGS_maxword);
-  auto wordDict = createWordDict(lexicon);
-  LOG(INFO) << "Number of words: " << wordDict.indexSize();
+  Dictionary wordDict;
+  LexiconMap lexicon;
+  if (!FLAGS_lexicon.empty()) {
+    lexicon = loadWords(FLAGS_lexicon, FLAGS_maxword);
+    wordDict = createWordDict(lexicon);
+    LOG(INFO) << "Number of words: " << wordDict.indexSize();
+  }
 
   DictionaryMap dicts = {{kTargetIdx, tokenDict}, {kWordIdx, wordDict}};
 
@@ -104,73 +120,93 @@ int main(int argc, char** argv) {
   LOG(INFO) << "[Dataset] Dataset loaded.";
 
   /* ===================== Test ===================== */
-  TestMeters meters;
+  // Prepare log writer
+  std::ofstream hypStream, refStream;
+  if (!FLAGS_sclite.empty()) {
+    auto fileName = cleanFilepath(FLAGS_test);
+    auto hypPath = pathsConcat(FLAGS_sclite, fileName + ".hyp");
+    auto refPath = pathsConcat(FLAGS_sclite, fileName + ".viterbi.ref");
+    hypStream.open(hypPath);
+    refStream.open(refPath);
+    if (!hypStream.is_open() || !hypStream.good()) {
+      LOG(FATAL) << "Error opening hypothesis file: " << hypPath;
+    }
+    if (!refStream.is_open() || !refStream.good()) {
+      LOG(FATAL) << "Error opening reference file: " << refPath;
+    }
+  }
 
+  TestMeters meters;
   EmissionSet emissionSet;
   meters.timer.resume();
-  int cnt = 1;
+  int cnt = 0;
   for (auto& sample : *ds) {
     auto rawEmission = network->forward({fl::input(sample[kInputIdx])}).front();
     auto emission = afToVector<float>(rawEmission);
-    auto ltrTarget = afToVector<int>(sample[kTargetIdx]);
-    auto wrdTarget = afToVector<int>(sample[kWordIdx]);
+    auto tokenTarget = afToVector<int>(sample[kTargetIdx]);
+    auto wordTarget = afToVector<int>(sample[kWordIdx]);
+    auto sampleId = readSampleIds(sample[kSampleIdx]).front();
 
-    /* viterbiPath + remove duplication/blank */
-    auto viterbiPath =
+    auto letterTarget = tknTarget2Ltr(tokenTarget, tokenDict);
+    std::vector<std::string> wordTargetStr;
+    if (FLAGS_uselexicon) {
+      wordTargetStr = wrdIdx2Wrd(wordTarget, wordDict);
+    } else {
+      wordTargetStr = tkn2Wrd(letterTarget);
+    }
+
+    // Tokens
+    auto tokenPrediction =
         afToVector<int>(criterion->viterbiPath(rawEmission.array()));
-    if (FLAGS_criterion == kCtcCriterion || FLAGS_criterion == kAsgCriterion) {
-      uniq(viterbiPath);
+    auto letterPrediction = tknPrediction2Ltr(tokenPrediction, tokenDict);
+
+    meters.lerSlice.add(letterPrediction, letterTarget);
+
+    // Words
+    std::vector<std::string> wrdPredictionStr = tkn2Wrd(letterPrediction);
+    meters.werSlice.add(wrdPredictionStr, wordTargetStr);
+
+    if (!FLAGS_sclite.empty()) {
+      refStream << join(" ", wordTargetStr) + " (" + sampleId + ")"
+                << std::endl;
+      hypStream << join(" ", wrdPredictionStr) + " (" + sampleId + ")"
+                << std::endl;
     }
-    if (FLAGS_criterion == kCtcCriterion) {
-      auto blankidx = tokenDict.getIndex(kBlankToken);
-      viterbiPath.erase(
-          std::remove(viterbiPath.begin(), viterbiPath.end(), blankidx),
-          viterbiPath.end());
-    }
-    remapLabels(viterbiPath, tokenDict);
-    remapLabels(ltrTarget, tokenDict);
-
-    meters.lerSlice.add(viterbiPath, ltrTarget);
-
-    auto wordViterbi = tknTensor2wrdTensor(
-        viterbiPath, wordDict, tokenDict, tokenDict.getIndex(kSilToken));
-
-    meters.werSlice.add(wordViterbi, wrdTarget);
 
     if (FLAGS_show) {
       meters.ler.reset();
       meters.wer.reset();
-      meters.ler.add(viterbiPath, ltrTarget);
-      meters.wer.add(wordViterbi, wrdTarget);
+      meters.ler.add(letterPrediction, letterTarget);
+      meters.wer.add(wrdPredictionStr, wordTargetStr);
 
-      std::cout << "|T|: " << tensor2letters(ltrTarget, tokenDict) << std::endl;
-      std::cout << "|P|: " << tensor2letters(viterbiPath, tokenDict)
-                << std::endl;
-      std::cout << "[sample: " << cnt << ", WER: " << meters.wer.value()[0]
+      std::cout << "|T|: " << join(" ", letterTarget) << std::endl;
+      std::cout << "|P|: " << join(" ", letterPrediction) << std::endl;
+      std::cout << "[sample: " << sampleId << ", WER: " << meters.wer.value()[0]
                 << "\%, LER: " << meters.ler.value()[0]
                 << "\%, total WER: " << meters.werSlice.value()[0]
                 << "\%, total LER: " << meters.lerSlice.value()[0]
                 << "\%, progress: " << static_cast<float>(cnt) / nSamples * 100
                 << "\%]" << std::endl;
-      ++cnt;
-      if (cnt == FLAGS_maxload) {
-        break;
-      }
     }
 
     /* Save emission and targets */
     int N = rawEmission.dims(0);
     int T = rawEmission.dims(1);
     emissionSet.emissions.emplace_back(emission);
-    emissionSet.letterTargets.emplace_back(ltrTarget);
-    emissionSet.wordTargets.emplace_back(wrdTarget);
+    emissionSet.tokenTargets.emplace_back(tokenTarget);
+    emissionSet.wordTargets.emplace_back(wordTargetStr);
 
     // while testing we use batchsize 1 and hence ds only has 1 sampleid
     emissionSet.sampleIds.emplace_back(
-        afToVector<std::string>(sample[kFileIdIdx]).front());
+        readSampleIds(sample[kSampleIdx]).front());
 
     emissionSet.emissionT.emplace_back(T);
     emissionSet.emissionN = N;
+
+    ++cnt;
+    if (cnt == FLAGS_maxload) {
+      break;
+    }
   }
   if (FLAGS_criterion == kAsgCriterion) {
     emissionSet.transition = afToVector<float>(criterion->param(0).array());

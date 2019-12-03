@@ -8,6 +8,7 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -18,11 +19,11 @@
 #include <glog/logging.h>
 
 #include "common/Defines.h"
-#include "common/Dictionary.h"
+#include "common/FlashlightUtils.h"
 #include "common/Transforms.h"
-#include "common/Utils.h"
 #include "criterion/criterion.h"
 #include "data/Featurize.h"
+#include "libraries/common/Dictionary.h"
 #include "module/module.h"
 #include "runtime/runtime.h"
 
@@ -37,8 +38,8 @@ int main(int argc, char** argv) {
     argvs.emplace_back(argv[i]);
   }
   gflags::SetUsageMessage(
-      "Usage: \n " + exec + " train [flags]\n or " + std::string() +
-      " continue [directory] [flags]\n or " + std::string(argv[0]) +
+      "Usage: \n " + exec + " train [flags]\n or " + exec +
+      " continue [directory] [flags]\n or " + exec +
       " fork [directory/model] [flags]");
 
   /* ===================== Parse Options ===================== */
@@ -50,15 +51,16 @@ int main(int argc, char** argv) {
   if (argc <= 1) {
     LOG(FATAL) << gflags::ProgramUsage();
   }
-  if (runStatus == "train") {
+  if (runStatus == kTrainMode) {
     LOG(INFO) << "Parsing command line flags";
     gflags::ParseCommandLineFlags(&argc, &argv, false);
     if (!FLAGS_flagsfile.empty()) {
       LOG(INFO) << "Reading flags from file " << FLAGS_flagsfile;
       gflags::ReadFromFlagsFile(FLAGS_flagsfile, argv[0], true);
     }
+    gflags::ParseCommandLineFlags(&argc, &argv, false);
     runPath = newRunPath(FLAGS_rundir, FLAGS_runname, FLAGS_tag);
-  } else if (runStatus == "continue") {
+  } else if (runStatus == kContinueMode) {
     runPath = argv[2];
     while (fileExists(getRunFile("model_last.bin", runIdx, runPath))) {
       ++runIdx;
@@ -82,13 +84,14 @@ int main(int argc, char** argv) {
       LOG(INFO) << "Reading flags from file " << FLAGS_flagsfile;
       gflags::ReadFromFlagsFile(FLAGS_flagsfile, argv[0], true);
     }
+    gflags::ParseCommandLineFlags(&argc, &argv, false);
     auto epoch = cfg.find(kEpoch);
     if (epoch == cfg.end()) {
       LOG(WARNING) << "Did not find epoch to start from, starting from 0.";
     } else {
       startEpoch = std::stoi(epoch->second);
     }
-  } else if (runStatus == "fork") {
+  } else if (runStatus == kForkMode) {
     reloadPath = argv[2];
     std::unordered_map<std::string, std::string> cfg;
     W2lSerializer::load(reloadPath, cfg);
@@ -110,6 +113,7 @@ int main(int argc, char** argv) {
       LOG(INFO) << "Reading flags from file" << FLAGS_flagsfile;
       gflags::ReadFromFlagsFile(FLAGS_flagsfile, argv[0], true);
     }
+    gflags::ParseCommandLineFlags(&argc, &argv, false);
     runPath = newRunPath(FLAGS_rundir, FLAGS_runname, FLAGS_tag);
   } else {
     LOG(FATAL) << gflags::ProgramUsage();
@@ -119,19 +123,18 @@ int main(int argc, char** argv) {
   af::setSeed(FLAGS_seed);
   af::setFFTPlanCacheSize(FLAGS_fftcachesize);
 
-  maybeInitDistributedEnv(
-      FLAGS_enable_distributed,
-      FLAGS_world_rank,
-      FLAGS_world_size,
-      FLAGS_rndv_filepath);
+  std::shared_ptr<fl::Reducer> reducer = nullptr;
+  if (FLAGS_enable_distributed) {
+    initDistributed(FLAGS_world_rank, FLAGS_world_size, FLAGS_rndv_filepath);
+    reducer = std::make_shared<fl::CoalescingReducer>(
+        1.0 / fl::getWorldSize(), true, true);
+  }
 
-  auto worldRank = fl::getWorldRank();
-  auto worldSize = fl::getWorldSize();
-
+  int worldRank = fl::getWorldRank();
+  int worldSize = fl::getWorldSize();
   bool isMaster = (worldRank == 0);
 
   LOG_MASTER(INFO) << "Gflags after parsing \n" << serializeGflags("; ");
-
   LOG_MASTER(INFO) << "Experiment path: " << runPath;
   LOG_MASTER(INFO) << "Experiment runidx: " << runIdx;
 
@@ -159,17 +162,35 @@ int main(int argc, char** argv) {
   }
 
   /* ===================== Create Dictionary & Lexicon ===================== */
-  Dictionary dict = createTokenDict();
-  int numClasses = dict.indexSize();
-  LOG_MASTER(INFO) << "Number of classes (network) = " << numClasses;
-
-  DictionaryMap dicts;
-  dicts.insert({kTargetIdx, dict});
-
-  LexiconMap lexicon;
-  if (FLAGS_listdata) {
-    lexicon = loadWords(FLAGS_lexicon, FLAGS_maxword);
+  auto dictPath = pathsConcat(FLAGS_tokensdir, FLAGS_tokens);
+  if (dictPath.empty() || !fileExists(dictPath)) {
+    throw std::runtime_error("Invalid dictionary filepath specified.");
   }
+  Dictionary tokenDict(dictPath);
+  // Setup-specific modifications
+  for (int64_t r = 1; r <= FLAGS_replabel; ++r) {
+    tokenDict.addEntry(std::to_string(r));
+  }
+  // ctc expects the blank label last
+  if (FLAGS_criterion == kCtcCriterion) {
+    tokenDict.addEntry(kBlankToken);
+  }
+  if (FLAGS_eostoken) {
+    tokenDict.addEntry(kEosToken);
+  }
+
+  int numClasses = tokenDict.indexSize();
+  LOG(INFO) << "Number of classes (network): " << numClasses;
+
+  Dictionary wordDict;
+  LexiconMap lexicon;
+  if (!FLAGS_lexicon.empty()) {
+    lexicon = loadWords(FLAGS_lexicon, FLAGS_maxword);
+    wordDict = createWordDict(lexicon);
+    LOG(INFO) << "Number of words: " << wordDict.indexSize();
+  }
+
+  DictionaryMap dicts = {{kTargetIdx, tokenDict}, {kWordIdx, wordDict}};
 
   /* =========== Create Network & Optimizers / Reload Snapshot ============ */
   std::shared_ptr<fl::Module> network;
@@ -178,7 +199,7 @@ int main(int argc, char** argv) {
   std::shared_ptr<fl::FirstOrderOptimizer> critoptim;
 
   auto scalemode = getCriterionScaleMode(FLAGS_onorm, FLAGS_sqnorm);
-  if (runStatus == "train") {
+  if (runStatus == kTrainMode) {
     auto archfile = pathsConcat(FLAGS_archdir, FLAGS_arch);
     LOG_MASTER(INFO) << "Loading architecture file from " << archfile;
     auto numFeatures = getSpeechFeatureSize();
@@ -192,7 +213,7 @@ int main(int argc, char** argv) {
           std::make_shared<ASGLoss>(numClasses, scalemode, FLAGS_transdiag);
     } else if (FLAGS_criterion == kSeq2SeqCriterion) {
       criterion = std::make_shared<Seq2SeqCriterion>(
-          buildSeq2Seq(numClasses, dict.getIndex(kEosToken)));
+          buildSeq2Seq(numClasses, tokenDict.getIndex(kEosToken)));
     } else {
       LOG(FATAL) << "unimplemented criterion";
     }
@@ -205,11 +226,11 @@ int main(int argc, char** argv) {
   LOG_MASTER(INFO) << "[Network Params: " << numTotalParams(network) << "]";
   LOG_MASTER(INFO) << "[Criterion] " << criterion->prettyString();
 
-  if (runStatus == "train" || runStatus == "fork") {
+  if (runStatus == kTrainMode || runStatus == kForkMode) {
     netoptim = initOptimizer(
-        network, FLAGS_netoptim, FLAGS_lr, FLAGS_momentum, FLAGS_weightdecay);
+        {network}, FLAGS_netoptim, FLAGS_lr, FLAGS_momentum, FLAGS_weightdecay);
     critoptim =
-        initOptimizer(criterion, FLAGS_critoptim, FLAGS_lrcrit, 0.0, 0.0);
+        initOptimizer({criterion}, FLAGS_critoptim, FLAGS_lrcrit, 0.0, 0.0);
   }
   LOG_MASTER(INFO) << "[Network Optimizer] " << netoptim->prettyString();
   LOG_MASTER(INFO) << "[Criterion Optimizer] " << critoptim->prettyString();
@@ -231,13 +252,13 @@ int main(int argc, char** argv) {
                      << " epochs)";
 
     linNetoptim = initOptimizer(
-        network,
+        {network},
         FLAGS_netoptim,
         initLinNetlr,
         FLAGS_momentum,
         FLAGS_weightdecay);
     linCritoptim =
-        initOptimizer(linseg, FLAGS_critoptim, initLinCritlr, 0.0, 0.0);
+        initOptimizer({linseg}, FLAGS_critoptim, initLinCritlr, 0.0, 0.0);
 
     LOG_MASTER(INFO) << "[Network Optimizer] " << linNetoptim->prettyString()
                      << " (for first " << FLAGS_linseg - startEpoch
@@ -250,7 +271,7 @@ int main(int argc, char** argv) {
   /* ===================== Meters ===================== */
   TrainMeters meters;
   for (const auto& s : validTagSets) {
-    meters.valid[s.first] = EditDistMeters();
+    meters.valid[s.first] = DatasetMeters();
   }
 
   // best perf so far on valid datasets
@@ -304,17 +325,18 @@ int main(int argc, char** argv) {
       if (FLAGS_itersave) {
         filename =
             getRunFile(format("model_iter_%03d.bin", iter), runIdx, runPath);
-      } else {
-        filename = getRunFile("model_last.bin", runIdx, runPath);
+        W2lSerializer::save(
+            filename, config, network, criterion, netoptim, critoptim);
       }
 
       // save last model
+      filename = getRunFile("model_last.bin", runIdx, runPath);
       W2lSerializer::save(
           filename, config, network, criterion, netoptim, critoptim);
 
       // save if better than ever for one valid
       for (const auto& v : validminerrs) {
-        double verr = meters.valid[v.first].edit.value()[0];
+        double verr = meters.valid[v.first].wrdEdit.value()[0];
         if (verr < validminerrs[v.first]) {
           validminerrs[v.first] = verr;
           std::string cleaned_v = cleanFilepath(v.first);
@@ -336,7 +358,7 @@ int main(int argc, char** argv) {
     trainds->shuffle(FLAGS_seed);
   }
 
-  std::unordered_map<std::string, std::shared_ptr<W2lDataset>> validds;
+  std::map<std::string, std::shared_ptr<W2lDataset>> validds;
   for (const auto& s : validTagSets) {
     validds[s.first] = createDataset(
         s.second, dicts, lexicon, FLAGS_batchsize, worldRank, worldSize);
@@ -346,7 +368,7 @@ int main(int argc, char** argv) {
   auto evalOutput = [&dicts, &criterion](
                         const af::array& op,
                         const af::array& target,
-                        fl::EditDistanceMeter& mtr) {
+                        DatasetMeters& mtr) {
     auto batchsz = op.dims(2);
     for (int b = 0; b < batchsz; ++b) {
       auto tgt = target(af::span, b);
@@ -364,29 +386,14 @@ int main(int argc, char** argv) {
       }
       auto tgtDict = dicts.find(kTargetIdx)->second;
 
-      if (FLAGS_criterion == kCtcCriterion ||
-          FLAGS_criterion == kAsgCriterion) {
-        uniq(viterbipath);
-      }
-      if (FLAGS_criterion == kCtcCriterion) {
-        auto blankidx = tgtDict.getIndex(kBlankToken);
-        viterbipath.erase(
-            std::remove(viterbipath.begin(), viterbipath.end(), blankidx),
-            viterbipath.end());
-      }
+      auto ltrPred = tknPrediction2Ltr(viterbipath, tgtDict);
+      auto ltrTgt = tknTarget2Ltr(tgtraw, tgtDict);
 
-      remapLabels(viterbipath, tgtDict);
-      remapLabels(tgtraw, tgtDict);
+      auto wrdPred = tkn2Wrd(ltrPred);
+      auto wrdTgt = tkn2Wrd(ltrTgt);
 
-      // break down word pieces into letters for evaluation,
-      // assume all letters exist in the dictionary
-      if (FLAGS_usewordpiece) {
-        viterbipath = toSingleLtr(viterbipath, tgtDict);
-        tgtraw = toSingleLtr(tgtraw, tgtDict);
-      }
-
-      mtr.add(
-          viterbipath.data(), tgtraw.data(), viterbipath.size(), tgtraw.size());
+      mtr.tknEdit.add(ltrPred, ltrTgt);
+      mtr.wrdEdit.add(wrdPred, wrdTgt);
     }
   };
 
@@ -394,19 +401,25 @@ int main(int argc, char** argv) {
                   std::shared_ptr<fl::Module> ntwrk,
                   std::shared_ptr<SequenceCriterion> crit,
                   std::shared_ptr<W2lDataset> testds,
-                  EditDistMeters& mtrs) {
+                  DatasetMeters& mtrs) {
     ntwrk->eval();
     crit->eval();
-    mtrs.edit.reset();
-    mtrs.wordedit.reset();
+    mtrs.tknEdit.reset();
+    mtrs.wrdEdit.reset();
+    mtrs.loss.reset();
 
     for (auto& sample : *testds) {
       auto output = ntwrk->forward({fl::input(sample[kInputIdx])}).front();
-      evalOutput(output.array(), sample[kTargetIdx], mtrs.edit);
+      auto loss =
+          crit->forward({output, fl::Variable(sample[kTargetIdx], false)})
+              .front();
+      mtrs.loss.add(loss.array());
+      evalOutput(output.array(), sample[kTargetIdx], mtrs);
     }
   };
 
-  double gradNorm = 1.0 / (FLAGS_batchsize * worldSize);
+  auto trainEvalIds =
+      getTrainEvalIds(trainds->size(), FLAGS_pcttraineval, FLAGS_seed);
 
   auto train = [&meters,
                 &test,
@@ -414,8 +427,9 @@ int main(int argc, char** argv) {
                 &saveModels,
                 &evalOutput,
                 &validds,
-                gradNorm,
-                &startEpoch](
+                &trainEvalIds,
+                &startEpoch,
+                reducer](
                    std::shared_ptr<fl::Module> ntwrk,
                    std::shared_ptr<SequenceCriterion> crit,
                    std::shared_ptr<W2lDataset> trainset,
@@ -425,12 +439,14 @@ int main(int argc, char** argv) {
                    double initcritlr,
                    bool clampCrit,
                    int nepochs) {
-    fl::distributeModuleGrads(ntwrk, gradNorm);
-    fl::distributeModuleGrads(crit, gradNorm);
+    if (reducer) {
+      fl::distributeModuleGrads(ntwrk, reducer);
+      fl::distributeModuleGrads(crit, reducer);
+    }
 
-    meters.loss.reset();
-    meters.train.edit.reset();
-    meters.train.wordedit.reset();
+    meters.train.loss.reset();
+    meters.train.tknEdit.reset();
+    meters.train.wrdEdit.reset();
 
     fl::allReduceParameters(ntwrk);
     fl::allReduceParameters(crit);
@@ -472,15 +488,21 @@ int main(int argc, char** argv) {
         LOG(FATAL) << "Error while saving models: " << ex.what();
       }
       // reset meters for next readings
-      meters.loss.reset();
-      meters.train.edit.reset();
-      meters.train.wordedit.reset();
+      meters.train.loss.reset();
+      meters.train.tknEdit.reset();
+      meters.train.wrdEdit.reset();
     };
 
     int64_t curEpoch = startEpoch;
     int64_t sampleIdx = 0;
     while (curEpoch < nepochs) {
-      double lrScale = std::pow(FLAGS_gamma, curEpoch / FLAGS_stepsize);
+      double lrScale = 1;
+      if (FLAGS_lrcosine) {
+        const double pi = std::acos(-1);
+        lrScale = std::cos(((double)curEpoch) / ((double)nepochs) * pi / 2.0);
+      } else {
+        lrScale = std::pow(FLAGS_gamma, curEpoch / FLAGS_stepsize);
+      }
       netopt->setLr(lrScale * initlr);
       critopt->setLr(lrScale * initcritlr);
 
@@ -508,7 +530,8 @@ int main(int argc, char** argv) {
         meters.stats.add(sample[kInputIdx], sample[kTargetIdx]);
         if (af::anyTrue<bool>(af::isNaN(sample[kInputIdx])) ||
             af::anyTrue<bool>(af::isNaN(sample[kTargetIdx]))) {
-          LOG(FATAL) << "Sample has NaN values";
+          LOG(FATAL) << "Sample has NaN values - "
+                     << join(",", readSampleIds(sample[kSampleIdx]));
         }
 
         // forward
@@ -523,17 +546,15 @@ int main(int argc, char** argv) {
         meters.critfwdtimer.stopAndIncUnit();
 
         if (af::anyTrue<bool>(af::isNaN(loss.array()))) {
-          LOG(FATAL) << "Loss has NaN values";
+          LOG(FATAL) << "Loss has NaN values. Samples - "
+                     << join(",", readSampleIds(sample[kSampleIdx]));
         }
-        auto batchLoss = afToVector<float>(loss.array());
-        for (const auto lossval : batchLoss) {
-          meters.loss.add(lossval);
-        }
+        meters.train.loss.add(loss.array());
 
         int64_t batchIdx = (sampleIdx - 1) % trainset->size();
         int64_t globalBatchIdx = trainset->getGlobalBatchIdx(batchIdx);
-        if (globalBatchIdx % 100 < FLAGS_pcttraineval) {
-          evalOutput(output.array(), sample[kTargetIdx], meters.train.edit);
+        if (trainEvalIds.find(globalBatchIdx) != trainEvalIds.end()) {
+          evalOutput(output.array(), sample[kTargetIdx], meters.train);
         }
 
         // backward
@@ -541,11 +562,24 @@ int main(int argc, char** argv) {
         netopt->zeroGrad();
         critopt->zeroGrad();
         loss.backward();
-
+        if (reducer) {
+          reducer->finalize();
+        }
         af::sync();
         meters.bwdtimer.stopAndIncUnit();
+
+        // optimizer
         meters.optimtimer.resume();
 
+        // scale down gradients by batchsize
+        for (const auto& p : ntwrk->params()) {
+          p.grad() = p.grad() / FLAGS_batchsize;
+        }
+        for (const auto& p : crit->params()) {
+          p.grad() = p.grad() / FLAGS_batchsize;
+        }
+
+        // clamp gradients
         if (FLAGS_maxgradnorm > 0) {
           auto params = ntwrk->params();
           if (clampCrit) {
@@ -554,6 +588,8 @@ int main(int argc, char** argv) {
           }
           fl::clipGradNorm(params, FLAGS_maxgradnorm);
         }
+
+        // update weights
         critopt->step();
         netopt->step();
         af::sync();
@@ -592,6 +628,25 @@ int main(int argc, char** argv) {
 
     startEpoch = FLAGS_linseg;
     LOG_MASTER(INFO) << "Finished LinSeg";
+  }
+
+  if (FLAGS_pretrainWindow - startEpoch > 0) {
+    auto s2s = std::dynamic_pointer_cast<Seq2SeqCriterion>(criterion);
+    if (!s2s) {
+      LOG(FATAL) << "Window pretraining only allowed for seq2seq.";
+    }
+    train(
+        network,
+        criterion,
+        trainds,
+        netoptim,
+        critoptim,
+        FLAGS_lr,
+        FLAGS_lrcrit,
+        true /* clampCrit */,
+        FLAGS_pretrainWindow);
+    s2s->clearWindow();
+    startEpoch = FLAGS_pretrainWindow;
   }
 
   train(

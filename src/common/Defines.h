@@ -10,6 +10,8 @@
 
 #include <gflags/gflags.h>
 
+#include "libraries/common/Defines.h"
+
 #define W2L_VERSION "0.1"
 
 namespace w2l {
@@ -19,10 +21,13 @@ namespace w2l {
 constexpr size_t kInputIdx = 0;
 constexpr size_t kTargetIdx = 1;
 constexpr size_t kWordIdx = 2;
-constexpr size_t kFileIdIdx = 3;
+constexpr size_t kSampleIdx = 3;
 constexpr size_t kNumDataIdx = 4; // total number of dataset indices
 
 // Various constants used in w2l
+constexpr const char* kTrainMode = "train";
+constexpr const char* kContinueMode = "continue";
+constexpr const char* kForkMode = "fork";
 constexpr const char* kGflags = "gflags";
 constexpr const char* kCommandLine = "commandline";
 constexpr const char* kUserName = "username";
@@ -39,16 +44,10 @@ constexpr const char* kAdadeltaOptimizer = "adadelta";
 constexpr const char* kCtcCriterion = "ctc";
 constexpr const char* kAsgCriterion = "asg";
 constexpr const char* kSeq2SeqCriterion = "seq2seq";
-constexpr const char* kEosToken = "$";
-constexpr const char* kBlankToken = "#";
-constexpr const char* kSilToken = "|";
-constexpr const char* kUnkToken = "<unk>";
 constexpr int kTargetPadValue = -1;
 constexpr int kMaxDevicePerNode = 8;
 
 // Feature params
-constexpr int kFrameSizeMs = 25;
-constexpr int kFrameStrideMs = 10;
 constexpr int kLifterParam = 22;
 constexpr int kPrefetchSize = 2;
 
@@ -70,13 +69,12 @@ DECLARE_bool(eostoken);
 DECLARE_string(dataorder);
 DECLARE_int64(inputbinsize);
 DECLARE_int64(outputbinsize);
-DECLARE_bool(listdata);
+DECLARE_bool(blobdata);
 DECLARE_string(wordseparator);
 DECLARE_double(sampletarget);
 
 /* ========== FILTERING OPTIONS ========== */
 
-DECLARE_bool(skipoov);
 DECLARE_int64(minisz);
 DECLARE_int64(maxisz);
 DECLARE_int64(mintsz);
@@ -88,6 +86,7 @@ DECLARE_int64(localnrmlleftctx);
 DECLARE_int64(localnrmlrightctx);
 DECLARE_string(onorm);
 DECLARE_bool(sqnorm);
+DECLARE_bool(lrcosine);
 
 /* ========== LEARNING HYPER-PARAMETER OPTIONS ========== */
 
@@ -123,6 +122,8 @@ DECLARE_double(melfloor);
 DECLARE_int64(filterbanks);
 DECLARE_int64(devwin);
 DECLARE_int64(fftcachesize);
+DECLARE_int64(framesizems);
+DECLARE_int64(framestridems);
 
 /* ========== RUN OPTIONS ========== */
 
@@ -137,40 +138,49 @@ DECLARE_string(tag);
 DECLARE_int64(seed);
 DECLARE_int64(memstepsize);
 DECLARE_int64(reportiters);
-DECLARE_int64(pcttraineval);
+DECLARE_double(pcttraineval);
 
 /* ========== ARCHITECTURE OPTIONS ========== */
 
 DECLARE_string(arch);
 DECLARE_string(criterion);
-DECLARE_bool(garbage);
 DECLARE_int64(encoderdim);
 
 /* ========== DECODER OPTIONS ========== */
 
 DECLARE_bool(show);
 DECLARE_bool(showletters);
-DECLARE_bool(forceendsil);
 DECLARE_bool(logadd);
+DECLARE_bool(uselexicon);
 
 DECLARE_string(smearing);
 DECLARE_string(lmtype);
 DECLARE_string(lexicon);
+DECLARE_string(lm_vocab);
 DECLARE_string(emission_dir);
 DECLARE_string(lm);
 DECLARE_string(am);
 DECLARE_string(sclite);
+DECLARE_string(decodertype);
 
 DECLARE_double(lmweight);
 DECLARE_double(wordscore);
 DECLARE_double(silweight);
 DECLARE_double(unkweight);
-DECLARE_double(beamscore);
+DECLARE_double(beamthreshold);
 
 DECLARE_int32(maxload);
 DECLARE_int32(maxword);
 DECLARE_int32(beamsize);
+DECLARE_int32(beamsizetoken);
 DECLARE_int32(nthread_decoder);
+DECLARE_int32(lm_memory);
+
+// Seq2Seq
+DECLARE_double(smoothingtemperature);
+DECLARE_int32(attentionthreshold);
+DECLARE_double(hardselection);
+DECLARE_double(softselection);
 
 /* ========== ASG OPTIONS ========== */
 
@@ -188,6 +198,10 @@ DECLARE_double(labelsmooth);
 DECLARE_bool(inputfeeding);
 DECLARE_string(attention);
 DECLARE_string(attnWindow);
+DECLARE_int64(attndim);
+DECLARE_int64(attnconvchannel);
+DECLARE_int64(attnconvkernel);
+DECLARE_int64(numattnhead);
 DECLARE_int64(leftWindowSize);
 DECLARE_int64(rightWindowSize);
 DECLARE_int64(maxsil);
@@ -198,6 +212,11 @@ DECLARE_int64(softwoffset);
 DECLARE_double(softwrate);
 DECLARE_double(softwstd);
 DECLARE_bool(trainWithWindow);
+DECLARE_int64(pretrainWindow);
+DECLARE_double(gumbeltemperature);
+DECLARE_int64(decoderrnnlayer);
+DECLARE_int64(decoderattnround);
+DECLARE_double(decoderdropout);
 
 /* ========== DISTRIBUTED TRAINING ========== */
 DECLARE_bool(enable_distributed);
@@ -208,6 +227,6 @@ DECLARE_string(rndv_filepath);
 /* ========== FB SPECIFIC ========== */
 DECLARE_string(target);
 DECLARE_bool(everstoredb);
-DECLARE_string(targettype);
+DECLARE_bool(use_memcache);
 
 } // namespace w2l

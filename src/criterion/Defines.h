@@ -8,25 +8,13 @@
 
 #pragma once
 
-#include <flashlight/flashlight.h>
-#include <functional>
+#include "libraries/criterion/Defines.h"
 
 namespace w2l {
 
-using CriterionScaleFn = std::function<float(
-    int64_t /* alphabet size */,
-    int64_t /* timeframes */,
-    int64_t /* labelsize */)>;
-
-enum class CriterionScaleMode {
-  NONE = 0,
-  INPUT_SZ = 1,
-  INPUT_SZ_SQRT = 2,
-  TARGET_SZ = 3,
-  TARGET_SZ_SQRT = 4,
-};
-
 // sampling strategy to use in decoder in place of teacher forcing
-const std::string kModelSampling = "model";
-const std::string kRandSampling = "rand";
+constexpr const char* kModelSampling = "model";
+constexpr const char* kRandSampling = "rand";
+constexpr const char* kGumbelSampling = "gumbel";
+
 } // namespace w2l

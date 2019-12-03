@@ -9,9 +9,9 @@
 #include <gtest/gtest.h>
 
 #include "TestUtils.h"
-#include "feature/Dct.h"
+#include "libraries/feature/Dct.h"
 
-using speech::Dct;
+using w2l::Dct;
 
 // Matlab code used:
 // dctm = @( N, M )( sqrt(2.0/M) * cos( repmat([0:N-1].',1,M) ...

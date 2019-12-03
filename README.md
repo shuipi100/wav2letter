@@ -1,12 +1,14 @@
 # wav2letter++
 
-wav2letter++ is a fast open source speech processing toolkit from the Speech Team at Facebook AI Research.
-It is written entirely in C++ and uses the [ArrayFire](https://github.com/arrayfire/arrayfire) tensor library and the [flashlight](https://github.com/facebookresearch/flashlight) machine learning library for maximum efficiency.
-Our approach is detailed in this [arXiv paper](https://arxiv.org/abs/1812.07625).
+[![CircleCI](https://circleci.com/gh/facebookresearch/wav2letter.svg?style=svg)](https://circleci.com/gh/facebookresearch/wav2letter)
 
-The goal of this software is to facilitate research in end-to-end models for speech recognition.
+wav2letter++ is a fast, open source speech processing toolkit from the Speech team at Facebook AI Research built to facilitate research in end-to-end models for speech recognition. It is written entirely in C++ and uses the [ArrayFire](https://github.com/arrayfire/arrayfire) tensor library and the [flashlight](https://github.com/facebookresearch/flashlight) machine learning library for maximum efficiency. Our approach is detailed in this [arXiv paper](https://arxiv.org/abs/1812.07625).
 
-The previous version of wav2letter (written in Lua) can be found in the "wav2letter-lua" branch under the repository.
+This repository also contains pre-trained models and implementations for various ASR results including:
+- [Likhomanenko et al. (2019): Who Needs Words? Lexicon-free Speech Recognition](recipes/models/lexicon_free/README.md)
+- [Hannun et al. (2019): Sequence-to-Sequence Speech Recognition with Time-Depth Separable Convolutions](recipes/models/seq2seq_tds/README.md)
+
+The previous iteration of wav2letter (written in Lua) can be found in the [`wav2letter-lua`](https://github.com/facebookresearch/wav2letter/tree/wav2letter-lua) branch.
 
 ## Building wav2letter++
 See [Building Instructions](docs/installation.md) for details.
@@ -19,6 +21,8 @@ See [Building Instructions](docs/installation.md) for details.
 To get started with wav2letter++, checkout the [tutorials](tutorials) section.
 
 We also provide complete recipes for WSJ, Timit and Librispeech and they can be found in [recipes](recipes) folder.
+
+Finally, we provide [Python bindings](bindings/python) for a subset of wav2letter++ (featurization, decoder, and ASG criterion).
 
 ## Citation
 

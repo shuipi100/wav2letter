@@ -13,9 +13,10 @@
 #include <future>
 #include <memory>
 
-#include "common/Dictionary.h"
+#include "common/FlashlightUtils.h"
 #include "common/Transforms.h"
-#include "common/Utils.h"
+#include "libraries/common/Dictionary.h"
+#include "libraries/common/WordUtils.h"
 
 using namespace w2l;
 
@@ -123,7 +124,7 @@ static std::function<int(void)> makeSucceedsAfterMs(double ms) {
 }
 
 template <class Fn>
-std::future<fl::cpp::result_of_t<Fn()>> retryAsync(
+std::future<typename std::result_of<Fn()>::type> retryAsync(
     std::chrono::duration<double> initial,
     double factor,
     int64_t iters,
@@ -184,87 +185,91 @@ TEST(W2lCommonTest, RetryWithBackoff) {
       retryAsync(ms0, 1.0, 5, alwaysFailsVoid).get(), std::runtime_error);
 }
 
-TEST(W2lCommonTest, Replabel) {
+TEST(W2lCommonTest, PackReplabels) {
   Dictionary dict;
-  dict.addToken("1", 1);
-  dict.addToken("2", 2);
-  dict.addToken("3", 3);
-  std::vector<int> lab = {5, 6, 6, 6, 10, 8, 8, 10, 10, 10, 10, 10};
+  dict.addEntry("1", 1);
+  dict.addEntry("2", 2);
+  dict.addEntry("3", 3);
 
-  auto lab0 = lab;
-  replaceReplabels(lab0, 0, dict);
-  ASSERT_THAT(
-      lab0,
-      ::testing::ElementsAreArray({5, 6, 6, 6, 10, 8, 8, 10, 10, 10, 10, 10}));
-  invReplaceReplabels(lab0, 0, dict);
-  ASSERT_THAT(lab0, ::testing::ElementsAreArray(lab));
+  std::vector<int> labels = {5, 6, 6, 6, 10, 8, 8, 10, 10, 10, 10, 10};
+  std::vector<std::vector<int>> packedCheck(4);
+  packedCheck[0] = {5, 6, 6, 6, 10, 8, 8, 10, 10, 10, 10, 10};
+  packedCheck[1] = {5, 6, 1, 6, 10, 8, 1, 10, 1, 10, 1, 10};
+  packedCheck[2] = {5, 6, 2, 10, 8, 1, 10, 2, 10, 1};
+  packedCheck[3] = {5, 6, 2, 10, 8, 1, 10, 3, 10};
 
-  auto lab1 = lab;
-  replaceReplabels(lab1, 1, dict);
-  ASSERT_THAT(
-      lab1,
-      ::testing::ElementsAreArray({5, 6, 1, 6, 10, 8, 1, 10, 1, 10, 1, 10}));
-  invReplaceReplabels(lab1, 1, dict);
-  ASSERT_THAT(lab1, ::testing::ElementsAreArray(lab));
-
-  auto lab2 = lab;
-  replaceReplabels(lab2, 2, dict);
-  ASSERT_THAT(
-      lab2, ::testing::ElementsAreArray({5, 6, 2, 10, 8, 1, 10, 2, 10, 1}));
-  invReplaceReplabels(lab2, 2, dict);
-  ASSERT_THAT(lab2, ::testing::ElementsAreArray(lab));
-
-  auto lab3 = lab;
-  replaceReplabels(lab3, 3, dict);
-  ASSERT_THAT(
-      lab3, ::testing::ElementsAreArray({5, 6, 2, 10, 8, 1, 10, 3, 10}));
-  invReplaceReplabels(lab3, 3, dict);
-  ASSERT_THAT(lab3, ::testing::ElementsAreArray(lab));
+  for (int i = 0; i <= 3; ++i) {
+    auto packed = packReplabels(labels, dict, i);
+    ASSERT_EQ(packed, packedCheck[i]);
+    auto unpacked = unpackReplabels(packed, dict, i);
+    ASSERT_EQ(unpacked, labels);
+  }
 }
 
 TEST(W2lCommonTest, Dictionary) {
   Dictionary dict;
-  dict.addToken("1", 1);
-  dict.addToken("2", 2);
-  dict.addToken("3", 3);
-  dict.addToken("4", 3);
+  dict.addEntry("1", 1);
+  dict.addEntry("2", 2);
+  dict.addEntry("3", 3);
+  dict.addEntry("4", 3);
 
-  ASSERT_EQ(dict.getToken(1), "1");
-  ASSERT_EQ(dict.getToken(3), "3");
+  ASSERT_EQ(dict.getEntry(1), "1");
+  ASSERT_EQ(dict.getEntry(3), "3");
 
   ASSERT_EQ(dict.getIndex("2"), 2);
   ASSERT_EQ(dict.getIndex("4"), 3);
 
-  ASSERT_EQ(dict.tokenSize(), 4);
+  ASSERT_EQ(dict.entrySize(), 4);
   ASSERT_EQ(dict.indexSize(), 3);
 
-  dict.addToken("5");
+  dict.addEntry("5");
   ASSERT_EQ(dict.getIndex("5"), 4);
-  ASSERT_EQ(dict.tokenSize(), 5);
+  ASSERT_EQ(dict.entrySize(), 5);
 
-  dict.addToken("6");
+  dict.addEntry("6");
   ASSERT_EQ(dict.getIndex("6"), 5);
   ASSERT_EQ(dict.indexSize(), 5);
 }
 
-TEST(W2lCommonTest, InvReplabel) {
+TEST(W2lCommonTest, UnpackReplabels) {
   Dictionary dict;
-  dict.addToken("1", 1);
-  dict.addToken("2", 2);
-  dict.addToken("3", 3);
-  std::vector<int> lab = {6, 3, 7, 2, 8, 0, 1};
+  dict.addEntry("1", 1);
+  dict.addEntry("2", 2);
+  dict.addEntry("3", 3);
+  std::vector<int> labels = {6, 3, 7, 2, 8, 0, 1};
 
-  auto lab1 = lab;
-  invReplaceReplabels(lab1, 1, dict);
-  ASSERT_THAT(lab1, ::testing::ElementsAre(6, 3, 7, 2, 8, 0, 0));
+  auto unpacked1 = unpackReplabels(labels, dict, 1);
+  ASSERT_THAT(unpacked1, ::testing::ElementsAre(6, 3, 7, 2, 8, 0, 0));
 
-  auto lab2 = lab;
-  invReplaceReplabels(lab2, 2, dict);
-  ASSERT_THAT(lab2, ::testing::ElementsAre(6, 3, 7, 7, 7, 8, 0, 0));
+  auto unpacked2 = unpackReplabels(labels, dict, 2);
+  ASSERT_THAT(unpacked2, ::testing::ElementsAre(6, 3, 7, 7, 7, 8, 0, 0));
 
-  auto lab3 = lab;
-  invReplaceReplabels(lab3, 3, dict);
-  ASSERT_THAT(lab3, ::testing::ElementsAre(6, 6, 6, 6, 7, 7, 7, 8, 0, 0));
+  auto unpacked3 = unpackReplabels(labels, dict, 3);
+  ASSERT_THAT(unpacked3, ::testing::ElementsAre(6, 6, 6, 6, 7, 7, 7, 8, 0, 0));
+}
+
+TEST(W2lCommonTest, UnpackReplabelsIgnoresInvalid) {
+  Dictionary dict;
+  dict.addEntry("1", 1);
+  dict.addEntry("2", 2);
+
+  // The initial replabel "1", with no prior token to repeat, is ignored.
+  std::vector<int> labels1 = {1, 5, 1, 6};
+  auto unpacked1 = unpackReplabels(labels1, dict, 2);
+  ASSERT_THAT(unpacked1, ::testing::ElementsAre(5, 5, 6));
+
+  // The final replabel "2", whose prior token is a replabel, is ignored.
+  std::vector<int> labels2 = {1, 5, 1, 2, 6};
+  auto unpacked2 = unpackReplabels(labels2, dict, 2);
+  ASSERT_THAT(unpacked2, ::testing::ElementsAre(5, 5, 6));
+  // With maxReps=1, "2" is not considered a replabel, altering the result.
+  auto unpacked2_1 = unpackReplabels(labels2, dict, 1);
+  ASSERT_THAT(unpacked2_1, ::testing::ElementsAre(5, 5, 2, 6));
+
+  // All replabels past the first "1" are ignored here.
+  std::vector<int> labels3 = {5, 1, 2, 1, 2, 6};
+  auto unpacked3 = unpackReplabels(labels3, dict, 2);
+  ASSERT_THAT(unpacked3, ::testing::ElementsAre(5, 5, 6));
 }
 
 TEST(W2lCommonTest, Uniq) {
@@ -350,11 +355,11 @@ TEST(W2lCommonTest, localNormalize) {
   }
 }
 
-TEST(W2lCommonTest, AfToVectorString) {
+TEST(W2lCommonTest, AfMatrixToStrings) {
   std::vector<int> arr = {119, 97,  118, -1,  -1,  -1,  -1,  -1, -1, -1, -1,
                           -1,  108, 101, 116, 116, 101, 114, -1, -1, -1};
   af::array afArr(6, 3, arr.data());
-  auto stringVec = afToVector<std::string>(afArr);
+  auto stringVec = afMatrixToStrings<int>(afArr, -1);
   ASSERT_EQ(stringVec.size(), 3);
   ASSERT_EQ(stringVec[0], "wav");
   ASSERT_EQ(stringVec[1], "");
@@ -385,12 +390,12 @@ TEST(W2lCommonTest, WrdToTarget) {
     for (auto p : l.second) {
       for (auto c : p) {
         if (!dict.contains(c)) {
-          dict.addToken(c);
+          dict.addEntry(c);
         }
       }
     }
   }
-  dict.addToken("_");
+  dict.addEntry("_");
 
   std::vector<std::string> words = {"123", "456"};
   auto target = wrd2Target(words, lexicon, dict);
@@ -427,18 +432,52 @@ TEST(W2lCommonTest, WrdToTarget) {
 TEST(W2lCommonTest, TargetToSingleLtr) {
   gflags::FlagSaver flagsaver;
   w2l::FLAGS_wordseparator = "_";
+  w2l::FLAGS_usewordpiece = true;
 
   Dictionary dict;
   for (int i = 0; i < 10; ++i) {
-    dict.addToken(std::to_string(i), i);
+    dict.addEntry(std::to_string(i), i);
   }
-  dict.addToken("_", 10);
-  dict.addToken("23_", 230);
-  dict.addToken("456_", 4560);
+  dict.addEntry("_", 10);
+  dict.addEntry("23_", 230);
+  dict.addEntry("456_", 4560);
 
   std::vector<int> words = {1, 230, 4560};
-  auto target = toSingleLtr(words, dict);
-  ASSERT_THAT(target, ::testing::ElementsAreArray({1, 2, 3, 10, 4, 5, 6}));
+  auto target = tknIdx2Ltr(words, dict);
+  ASSERT_THAT(
+      target, ::testing::ElementsAreArray({"1", "2", "3", "_", "4", "5", "6"}));
+}
+
+TEST(W2lCommonTest, UT8Split) {
+  // ASCII
+  std::string in1 = "Vendetta";
+  auto in1Tkns = splitWrd(in1);
+  for (int i = 0; i < in1.size(); ++i) {
+    ASSERT_EQ(std::string(1, in1[i]), in1Tkns[i]);
+  }
+
+  // NFKC encoding
+  // @lint-ignore TXT5 Source code should only include printable US-ASCII bytes.
+  std::string in2 = "Beyoncé";
+  auto in2Tkns = splitWrd(in2);
+
+  // @lint-ignore TXT5 Source code should only include printable US-ASCII bytes.
+  std::vector<std::string> in2TknsExp = {"B", "e", "y", "o", "n", "c", "é"};
+  ASSERT_EQ(in2Tkns.size(), 7);
+  for (int i = 0; i < in2Tkns.size(); ++i) {
+    ASSERT_EQ(in2TknsExp[i], in2Tkns[i]);
+  }
+
+  // NFKD encoding
+  // @lint-ignore TXT5 Source code should only include printable US-ASCII bytes.
+  std::string in3 = "Beyoncé";
+  auto in3Tkns = splitWrd(in3);
+  std::vector<std::string> in3TknsExp = {
+      "B", "e", "y", "o", "n", "c", "e", u8"\u0301"};
+  ASSERT_EQ(in3Tkns.size(), 8);
+  for (int i = 0; i < in3Tkns.size(); ++i) {
+    ASSERT_EQ(in3TknsExp[i], in3Tkns[i]);
+  }
 }
 
 int main(int argc, char** argv) {

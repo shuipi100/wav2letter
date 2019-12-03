@@ -1,133 +1,110 @@
-#include "criterion/FullConnectionCriterion.h"
+/**
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
 
-#include <cassert>
-#include <cmath>
+#include "criterion/FullConnectionCriterion.h"
 
 #include <flashlight/common/cuda.h>
 
 #include "criterion/CriterionUtils.h"
-#include "criterion/backend/cuda/kernels/FullConnectionCriterion.cuh"
+#include "libraries/criterion/cuda/FullConnectionCriterion.cuh"
 
-using namespace af;
+using fl::Variable;
+using FCC = w2l::cuda::FullConnectionCriterion<float>;
 
 namespace w2l {
 
 static void backward(
-    std::vector<fl::Variable>& inputs,
-    const fl::Variable& grad_output,
+    std::vector<Variable>& inputs,
+    const Variable& gradVar,
     int B,
-    int N,
     int T,
-    const array& fccacc,
-    const array& scale) {
-  assert(inputs.size() == 2);
-  const auto& gscale = scale * grad_output.array(); // [B]
-  const auto& trans = inputs[1].array(); // [N, N]
-  array transtmp(N, N, B, f64);
-  array fccgacc(N, B, T, f64);
-  auto gtrans = constant(0, N, N, B, f64);
-
-  const auto& final_em = fccacc(span, span, T - 1); // [N, B]
-  const auto& final_max = max(final_em, 0); // [1, B]
-  const auto& final_exp = exp(final_em - tile(final_max, N)); // [N, B]
-  const auto& final_dlse = final_exp / tile(sum(final_exp, 0), N); // [N, B]
-  fccgacc(span, span, T - 1) = final_dlse;
-
-  {
-    fl::DevicePtr trans_raw(trans);
-    fl::DevicePtr fccacc_raw(fccacc);
-    fl::DevicePtr transtmp_raw(transtmp);
-    fl::DevicePtr fccgacc_raw(fccgacc);
-    fl::DevicePtr gtrans_raw(gtrans);
-
-    FL_CUDA_CHECK(w2l::cuda::fullConnectionCriterionBackward(
-        T,
-        B,
-        N,
-        static_cast<const float*>(trans_raw.get()),
-        static_cast<double*>(transtmp_raw.get()),
-        static_cast<const double*>(fccacc_raw.get()),
-        static_cast<double*>(fccgacc_raw.get()),
-        static_cast<double*>(gtrans_raw.get()),
-        fl::cuda::getActiveStream()));
+    int N,
+    const af::array& trans,
+    af::array& workspace) {
+  if (gradVar.type() != f32) {
+    throw std::invalid_argument("FCC: grad must be float32");
   }
 
-  const auto& gem = fccgacc * tile(moddims(gscale, 1, B), N, 1, T); // [N, B, T]
-  auto gem_r = w2l::reorder(gem, 0, 2, 1).as(f32);
-  auto gtrans_r = sum(gtrans * tile(moddims(gscale, 1, 1, B), N, N), 2).as(f32);
+  const auto& grad = gradVar.array();
+  af::array inputGrad(N, T, B, f32);
+  af::array transGrad(N, N, f32);
 
-  inputs[0].addGrad(fl::Variable(gem_r, false));
-  inputs[1].addGrad(fl::Variable(gtrans_r, false));
+  {
+    fl::DevicePtr transRaw(trans);
+    fl::DevicePtr gradRaw(grad);
+    fl::DevicePtr inputGradRaw(inputGrad);
+    fl::DevicePtr transGradRaw(transGrad);
+    fl::DevicePtr workspaceRaw(workspace);
+    FCC::backward(
+        B,
+        T,
+        N,
+        static_cast<const float*>(transRaw.get()),
+        static_cast<const float*>(gradRaw.get()),
+        static_cast<float*>(inputGradRaw.get()),
+        static_cast<float*>(transGradRaw.get()),
+        workspaceRaw.get(),
+        fl::cuda::getActiveStream());
+  }
+
+  inputs[0].addGrad(Variable(inputGrad, false));
+  inputs[1].addGrad(Variable(transGrad, false));
 }
 
-fl::Variable FullConnectionCriterion::forward(
-    const fl::Variable& input,
-    const fl::Variable& target) {
-  int N = input.dims(0);
-  int T = input.dims(1);
-  int B = input.dims(2);
-  int L = target.dims(0);
+Variable FullConnectionCriterion::forward(
+    const Variable& inputVar,
+    const Variable& targetVar) {
+  const auto& transVar = param(0);
+  int B = inputVar.dims(2);
+  int T = inputVar.dims(1);
+  int N = inputVar.dims(0);
 
-  const auto& transitions = param(0);
-  if (N != transitions.dims(0)) {
-    throw std::runtime_error("FCC: Transition dims don't match N.");
+  if (N != transVar.dims(0)) {
+    throw std::invalid_argument("FCC: input dim doesn't match N");
+  } else if (inputVar.type() != f32) {
+    throw std::invalid_argument("FCC: input must be float32");
+  } else if (targetVar.type() != s32) {
+    throw std::invalid_argument("FCC: target must be int32");
   }
 
-  auto scaleFn = getCriterionScaleFn(scaleMode_);
-
-  std::vector<int> target_host(B * L);
-  std::vector<double> scale_host;
-
-  target.host(target_host.data());
-  for (int b = 0; b < B; b++) {
-    const auto target_p = target_host.data() + b * L;
-    int TN = getTargetSize(target_p, L);
-    TN = std::min(TN, T);
-    if (TN == 0) {
-      throw std::invalid_argument("Target size cannot be empty for FCC");
-    }
-    scale_host.push_back(scaleFn(N, T, TN));
-  }
-
-  array scale(B, scale_host.data());
-  array inp(w2l::reorder(input.array(), 0, 2, 1)); // [N, B, T]
-  array transtmp(N, N, B, f64);
-  array fccacc(N, B, T, f64);
-  fccacc(span, span, 0) = inp(span, span, 0);
+  const auto& input = inputVar.array();
+  const auto& target = targetVar.array();
+  const auto& targetSize = getTargetSizeArray(target, T);
+  const auto& trans = transVar.array();
+  af::array loss(B, f32);
+  af::array workspace(FCC::getWorkspaceSize(B, T, N), u8);
 
   {
-    fl::DevicePtr inp_raw(inp);
-    fl::DevicePtr trans_raw(transitions.array());
-    fl::DevicePtr transtmp_raw(transtmp);
-    fl::DevicePtr fccacc_raw(fccacc);
+    fl::DevicePtr inputRaw(input);
+    fl::DevicePtr targetSizeRaw(targetSize);
+    fl::DevicePtr transRaw(trans);
+    fl::DevicePtr lossRaw(loss);
+    fl::DevicePtr workspaceRaw(workspace);
 
-    FL_CUDA_CHECK(w2l::cuda::fullConnectionCriterionForward(
-        T,
+    FCC::forward(
         B,
+        T,
         N,
-        static_cast<const float*>(inp_raw.get()),
-        static_cast<const float*>(trans_raw.get()),
-        static_cast<double*>(transtmp_raw.get()),
-        static_cast<double*>(fccacc_raw.get()),
-        fl::cuda::getActiveStream()));
+        scaleMode_,
+        static_cast<const float*>(inputRaw.get()),
+        static_cast<const int*>(targetSizeRaw.get()),
+        static_cast<const float*>(transRaw.get()),
+        static_cast<float*>(lossRaw.get()),
+        workspaceRaw.get(),
+        fl::cuda::getActiveStream());
   }
 
-  const auto& final_em = fccacc(span, span, T - 1); // [N, B]
-  const auto& final_max = max(final_em, 0); // [1, B]
-  const auto& final_lse =
-      final_max + log(sum(exp(final_em - tile(final_max, N)), 0)); // [1, B]
-
-  const auto& fcc = moddims(final_lse, B) * scale;
-  if (anyTrue<bool>(isNaN(fcc))) {
-    throw std::runtime_error("Loss is NaN value");
-  }
-
-  auto grad_func = [B, N, T, fccacc, scale](
-                       std::vector<fl::Variable>& inputs,
-                       const fl::Variable& grad_output) {
-    backward(inputs, grad_output, B, N, T, fccacc, scale);
-  };
-  return fl::Variable(fcc.as(f32), {input, transitions}, grad_func);
+  return Variable(
+      loss,
+      {inputVar.withoutData(), transVar.withoutData()},
+      [=](std::vector<Variable>& inputs, const Variable& gradVar) mutable {
+        backward(inputs, gradVar, B, T, N, trans, workspace);
+      });
 }
 
 } // namespace w2l

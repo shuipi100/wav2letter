@@ -11,71 +11,64 @@
 #include <arrayfire.h>
 #include <flashlight/flashlight.h>
 
-#include "common/Utils.h"
+#include "common/FlashlightUtils.h"
 #include "module/module.h"
 
 using namespace fl;
 using namespace w2l;
 
-TEST(ModuleTest, ResidualFwd) {
-  auto conv = Conv2D(30, 50, 9, 7, 2, 3, 3, 2);
-  auto bn = BatchNorm(2, 50);
-  auto relu = ReLU();
-
+TEST(ModuleTest, TDSFwd) {
   int batchsize = 10;
-  auto input = Variable(af::randu(120, 100, 30, batchsize), false);
+  int timesteps = 120;
+  int w = 4;
+  int c = 10;
 
-  auto output_conv = conv.forward(input);
-  auto output_bn = bn.forward(output_conv);
+  auto tds = TDSBlock(c, 9, w);
+  auto input = Variable(af::randu(timesteps, w, c, batchsize), false);
 
-  auto res_module1 = Residual(3);
-  res_module1.add(conv);
-  res_module1.add(bn);
-  res_module1.add(relu);
-  res_module1.addShortcut(1, 3);
+  auto output = tds.forward({input})[0];
 
-  auto output1 = res_module1.forward(input);
-  auto output1_true = relu.forward(output_bn + output_conv);
-  ASSERT_TRUE(allClose(output1, output1_true));
-
-  auto res_module2 = Residual(3);
-  res_module2.add(conv);
-  res_module2.add(bn);
-  res_module2.add(relu);
-  res_module2.addShortcut(1, 4);
-  res_module2.addShortcut(1, 3);
-  res_module2.addShortcut(2, 4);
-
-  auto output2 = res_module2.forward(input);
-  auto output2_true =
-      relu.forward(output_bn + output_conv) + output_bn + output_conv;
-  ASSERT_TRUE(allClose(output2, output2_true));
+  ASSERT_EQ(output.dims(0), timesteps);
+  ASSERT_EQ(output.dims(1), w);
+  ASSERT_EQ(output.dims(2), c);
 }
 
-TEST(ModuleTest, ResidualSerialization) {
-  char* user = getenv("USER");
-  std::string userstr = "unknown";
-  if (user != nullptr) {
-    userstr = std::string(user);
+TEST(ModuleTest, SpecAugmentFwd) {
+  SpecAugment specAug(0, 27, 2, 100, 0.2, 2);
+  int T = 512, F = 80;
+  auto input = Variable(af::randu(T, F), false);
+
+  specAug.eval();
+  ASSERT_TRUE(fl::allClose(input, specAug(input)));
+
+  specAug.train();
+  auto output = specAug(input);
+  ASSERT_FALSE(fl::allClose(input, output));
+
+  // Every value of output is either 0 or input
+  for (int t = 0; t < T; ++t) {
+    for (int f = 0; f < F; ++f) {
+      auto o = output.array()(t, f).scalar<float>();
+      auto i = input.array()(t, f).scalar<float>();
+      ASSERT_TRUE(o == i || o == 0);
+    }
   }
-  const std::string path = "/tmp/" + userstr + "_test_res";
 
-  std::shared_ptr<Residual> model = std::make_shared<Residual>(3);
-  model->add(Linear(12, 6));
-  model->add(Linear(6, 6));
-  model->add(ReLU());
-  model->addShortcut(1, 3);
-  save(path, model);
+  // non-zero time frames are masked
+  int tZeros = 0;
+  for (int t = 0; t < T; ++t) {
+    auto curOutSlice = output.array().row(t);
+    tZeros = af::allTrue<bool>(curOutSlice == 0) ? tZeros + 1 : tZeros;
+  }
+  ASSERT_GT(tZeros, 0);
 
-  std::shared_ptr<Residual> loaded;
-  load(path, loaded);
-
-  auto input = Variable(af::randu(12, 10, 3, 4), false);
-  auto output = model->forward(input);
-  auto outputl = loaded->forward(input);
-
-  ASSERT_TRUE(allParamsClose(*loaded.get(), *model));
-  ASSERT_TRUE(allClose(outputl, output));
+  // non-zero frequency channels are masked
+  int fZeros = 0;
+  for (int f = 0; f < F; ++f) {
+    auto curOutSlice = output.array().col(f);
+    fZeros = af::allTrue<bool>(curOutSlice == 0) ? fZeros + 1 : fZeros;
+  }
+  ASSERT_GT(fZeros, 0);
 }
 
 int main(int argc, char** argv) {

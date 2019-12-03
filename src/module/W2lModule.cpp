@@ -6,16 +6,17 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "W2lModule.h"
-#include "module/Residual.h"
-
 #include <string>
 
 #include <glog/logging.h>
 
-#include "common/Utils.h"
+#include "W2lModule.h"
 
-#ifdef BUILD_FB_DEPENDENCIES
+#include "common/FlashlightUtils.h"
+#include "module/SpecAugment.h"
+#include "module/TDSBlock.h"
+
+#ifdef W2L_BUILD_FB_DEPENDENCIES
 #include "experimental/frontend/Frontend.h"
 #endif
 
@@ -122,6 +123,29 @@ std::shared_ptr<Module> parseLines(
     return std::make_shared<Conv2D>(cisz, cosz, cwx, 1, csx, 1, cpx, 0, cdx, 1);
   }
 
+  if (params[0] == "TDS") {
+    LOG_IF(FATAL, !inRange(4, params.size(), 6)) << "Failed parsing - " << line;
+    int cisz = std::stoi(params[1]);
+    int cwx = std::stoi(params[2]);
+    int freqdim = std::stoi(params[3]);
+    double dropprob = (params.size() >= 5 ? std::stod(params[4]) : 0);
+    int l2 = (params.size() >= 6 ? std::stoi(params[5]) : 0);
+    return std::make_shared<w2l::TDSBlock>(cisz, cwx, freqdim, dropprob, l2);
+  }
+
+  if (params[0] == "AC") {
+    LOG_IF(FATAL, !inRange(5, params.size(), 8)) << "Failed parsing - " << line;
+    int cisz = std::stoi(params[1]);
+    int cosz = std::stoi(params[2]);
+    int cwx = std::stoi(params[3]);
+    int csx = std::stoi(params[4]);
+    int cpx = (params.size() >= 6) ? std::stoi(params[5]) : 0;
+    float futurePartPx = (params.size() >= 7) ? std::stof(params[6]) : 1.;
+    int cdx = (params.size() >= 8) ? std::stoi(params[7]) : 1;
+    return std::make_shared<AsymmetricConv1D>(
+        cisz, cosz, cwx, csx, cpx, futurePartPx, cdx);
+  }
+
   if (params[0] == "C2") {
     LOG_IF(FATAL, !inRange(7, params.size(), 11))
         << "Failed parsing - " << line;
@@ -142,10 +166,20 @@ std::shared_ptr<Module> parseLines(
   /* ========== LINEAR ========== */
 
   if (params[0] == "L") {
-    LOG_IF(FATAL, params.size() != 3) << "Failed parsing - " << line;
+    LOG_IF(FATAL, !inRange(3, params.size(), 4)) << "Failed parsing - " << line;
     int lisz = std::stoi(params[1]);
     int losz = std::stoi(params[2]);
-    return std::make_shared<Linear>(lisz, losz);
+    bool bias = (params.size() == 4) && params[3] == "0" ? false : true;
+    return std::make_shared<Linear>(lisz, losz, bias);
+  }
+
+  /* ========== EMBEDDING ========== */
+
+  if (params[0] == "E") {
+    LOG_IF(FATAL, params.size() != 3) << "Failed parsing - " << line;
+    int embsz = std::stoi(params[1]);
+    int ntokens = std::stoi(params[2]);
+    return std::make_shared<Embedding>(embsz, ntokens);
   }
 
   /* ========== NORMALIZATIONS ========== */
@@ -208,6 +242,10 @@ std::shared_ptr<Module> parseLines(
     return std::make_shared<ReLU>();
   }
 
+  if (params[0] == "R6") {
+    return std::make_shared<ReLU6>();
+  }
+
   if (params[0] == "PR") {
     auto numParams = params.size() > 1 ? std::stoi(params[1]) : 1;
     auto initVal = params.size() > 2 ? std::stod(params[2]) : 0.25;
@@ -267,27 +305,59 @@ std::shared_ptr<Module> parseLines(
 
   /* ========== Residual block ========== */
   if (params[0] == "RES") {
-    LOG_IF(FATAL, params.size() <= 2) << "Failed parsing - " << line;
+    LOG_IF(FATAL, params.size() <= 3) << "Failed parsing - " << line;
 
     auto residualBlock = [&](const std::vector<std::string>& prms,
-                             int& numResLayers) {
-      numResLayers = std::stoi(prms[1]);
-      std::shared_ptr<w2l::Residual> resPtr =
-          std::make_shared<w2l::Residual>(numResLayers);
-      for (int i = 2; i + 1 < prms.size(); i += 2) {
-        resPtr->addShortcut(std::stoi(prms[i]), std::stoi(prms[i + 1]));
-      }
+                             int& numResLayerAndSkip) {
+      int numResLayers = std::stoi(prms[1]);
+      int numSkipConnections = std::stoi(prms[2]);
+      std::shared_ptr<Residual> resPtr = std::make_shared<Residual>();
 
-      for (int i = 1; i <= numResLayers; ++i) {
-        LOG_IF(FATAL, lineIdx + i >= lines.size())
+      int numProjections = 0;
+
+      for (int i = 1; i <= numResLayers + numSkipConnections; ++i) {
+        LOG_IF(FATAL, lineIdx + i + numProjections >= lines.size())
             << "Failed parsing Residual block";
-        resPtr->add(parseLine(lines[lineIdx + i]));
+        std::string resLine = lines[lineIdx + i + numProjections];
+        auto resLinePrms = w2l::splitOnWhitespace(resLine, true);
+
+        if (resLinePrms[0] == "SKIP") {
+          LOG_IF(FATAL, !inRange(3, resLinePrms.size(), 4))
+              << "Failed parsing - " << resLine;
+          resPtr->addShortcut(
+              std::stoi(resLinePrms[1]), std::stoi(resLinePrms[2]));
+          if (resLinePrms.size() == 4) {
+            resPtr->addScale(
+                std::stoi(resLinePrms[2]), std::stof(resLinePrms[3]));
+          }
+        } else if (resLinePrms[0] == "SKIPL") {
+          LOG_IF(FATAL, !inRange(4, resLinePrms.size(), 5))
+              << "Failed parsing - " << resLine;
+          int numProjectionLayers = std::stoi(resLinePrms[3]);
+          auto projection = std::make_shared<Sequential>();
+
+          for (int j = 1; j <= numProjectionLayers; ++j) {
+            LOG_IF(FATAL, lineIdx + i + numProjections + j >= lines.size())
+                << "Failed parsing Projection block";
+            projection->add(parseLine(lines[lineIdx + i + numProjections + j]));
+          }
+          resPtr->addShortcut(
+              std::stoi(resLinePrms[1]), std::stoi(resLinePrms[2]), projection);
+          if (resLinePrms.size() == 5) {
+            resPtr->addScale(
+                std::stoi(resLinePrms[2]), std::stof(resLinePrms[4]));
+          }
+          numProjections += numProjectionLayers;
+        } else {
+          resPtr->add(parseLine(resLine));
+        }
       }
 
+      numResLayerAndSkip = numResLayers + numSkipConnections + numProjections;
       return resPtr;
     };
 
-    auto numBlocks = params.size() % 2 == 1 ? std::stoi(params.back()) : 1;
+    auto numBlocks = params.size() == 4 ? std::stoi(params.back()) : 1;
     LOG_IF(FATAL, numBlocks <= 0)
         << "Invalid number of residual blocks: " << numBlocks;
 
@@ -302,8 +372,21 @@ std::shared_ptr<Module> parseLines(
     }
   }
 
+  /* ========== Data Augmentation  ========== */
+  if (params[0] == "SAUG") {
+    LOG_IF(FATAL, params.size() != 7) << "Failed parsing - " << line;
+    return std::make_shared<w2l::SpecAugment>(
+        std::stoi(params[1]),
+        std::stoi(params[2]),
+        std::stoi(params[3]),
+        std::stoi(params[4]),
+        std::stod(params[5]),
+        std::stoi(params[6]));
+  }
+
+#ifdef W2L_BUILD_FB_DEPENDENCIES
+
   /* ========== Trainable frontend ========== */
-#ifdef BUILD_FB_DEPENDENCIES
   if (params[0] == "SL2P") {
     return std::make_shared<w2l::SqL2Pooling>();
   }

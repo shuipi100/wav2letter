@@ -15,16 +15,15 @@
 #include <gtest/gtest.h>
 
 #include "common/Defines.h"
-#include "common/Dictionary.h"
+#include "common/FlashlightUtils.h"
 #include "common/Transforms.h"
-#include "common/Utils.h"
 #include "criterion/criterion.h"
-#include "decoder/Decoder.hpp"
-#include "decoder/KenLM.hpp"
-#include "decoder/Trie.hpp"
+#include "libraries/common/Dictionary.h"
+#include "libraries/decoder/Trie.h"
+#include "libraries/decoder/WordLMDecoder.h"
+#include "libraries/lm/KenLM.h"
 #include "module/module.h"
-#include "runtime/Logger.h"
-#include "runtime/Serial.h"
+#include "runtime/runtime.h"
 
 using namespace w2l;
 
@@ -37,97 +36,109 @@ using namespace w2l;
  * We pruned it so as to have much smaller size.
  */
 
+std::vector<int> tokens2Tensor(
+    const std::string& spelling,
+    const Dictionary& tokenDict) {
+  std::vector<int> ret;
+  ret.reserve(spelling.size());
+  auto tokens = splitWrd(spelling);
+  for (const auto& tkn : tokens) {
+    ret.push_back(tokenDict.getIndex(tkn));
+  }
+  ret = packReplabels(ret, tokenDict, FLAGS_replabel);
+  return ret;
+}
+
 TEST(DecoderTest, run) {
+  // TODO: It seems that emissions were generated with `--replabel=1` but the
+  // expected results of DecoderTest were generated with FLAGS_replabel
+  // at the default value, 0. Leaving it this way for now...
+  // FLAGS_replabel = 1;
   FLAGS_criterion = kAsgCriterion;
-  FLAGS_replabel = 1;
   std::string dataDir = "";
 #ifdef DECODER_TEST_DATADIR
   dataDir = DECODER_TEST_DATADIR;
 #endif
 
   /* ===================== Create Dataset ===================== */
-  EmissionSet emission_set;
+  EmissionSet emissionSet;
 
   // T, N
-  std::string tn_path = pathsConcat(dataDir, "TN.bin");
-  std::ifstream tn_stream(tn_path, std::ios::binary | std::ios::in);
-  std::vector<int> tn_array(2);
+  std::string tnPath = pathsConcat(dataDir, "TN.bin");
+  std::ifstream tnStream(tnPath, std::ios::binary | std::ios::in);
+  std::vector<int> tnArray(2);
   int T, N;
-  tn_stream.read((char*)tn_array.data(), 2 * sizeof(int));
-  T = tn_array[0];
-  N = tn_array[1];
-  emission_set.emissionN = N;
-  emission_set.emissionT.push_back(T);
-  tn_stream.close();
+  tnStream.read((char*)tnArray.data(), 2 * sizeof(int));
+  T = tnArray[0];
+  N = tnArray[1];
+  emissionSet.emissionN = N;
+  emissionSet.emissionT.push_back(T);
+  tnStream.close();
 
   // Emission
-  emission_set.emissions.resize(1);
-  emission_set.emissions[0].resize(T * N);
-  std::string emission_path = pathsConcat(dataDir, "emission.bin");
-  std::ifstream em_stream(emission_path, std::ios::binary | std::ios::in);
-  em_stream.read(
-      (char*)emission_set.emissions[0].data(), T * N * sizeof(float));
+  emissionSet.emissions.resize(1);
+  emissionSet.emissions[0].resize(T * N);
+  std::string emissionPath = pathsConcat(dataDir, "emission.bin");
+  std::ifstream em_stream(emissionPath, std::ios::binary | std::ios::in);
+  em_stream.read((char*)emissionSet.emissions[0].data(), T * N * sizeof(float));
   em_stream.close();
 
   // Transitions
   std::vector<float> transitions(N * N);
-  std::string transitions_path = pathsConcat(dataDir, "transition.bin");
-  std::ifstream tr_stream(transitions_path, std::ios::binary | std::ios::in);
+  std::string transitionsPath = pathsConcat(dataDir, "transition.bin");
+  std::ifstream tr_stream(transitionsPath, std::ios::binary | std::ios::in);
   tr_stream.read((char*)transitions.data(), N * N * sizeof(float));
   tr_stream.close();
 
   LOG(INFO) << "[Serialization] Loaded emissions [" << T << " x " << N << ']';
 
   /* ===================== Create Dictionary ===================== */
-  auto lexicon = loadWords(pathsConcat(dataDir, "words.lst"), -1);
-  auto tokenDict = createTokenDict(pathsConcat(dataDir, "letters.lst"));
+  auto lexicon = loadWords(pathsConcat(dataDir, "words.lst"));
+  Dictionary tokenDict(pathsConcat(dataDir, "letters.lst"));
+  tokenDict.addEntry("1"); // replabel
   auto wordDict = createWordDict(lexicon);
 
   LOG(INFO) << "[Dictionary] Number of words: " << wordDict.indexSize();
 
   /* ===================== Decode ===================== */
   /* -------- Build Language Model --------*/
-  auto lm = std::make_shared<KenLM>(pathsConcat(dataDir, "lm.arpa"));
+  auto lm = std::make_shared<KenLM>(pathsConcat(dataDir, "lm.arpa"), wordDict);
   LOG(INFO) << "[Decoder] LM constructed.\n";
 
   std::vector<std::string> sentence{"the", "cat", "sat", "on", "the", "mat"};
   auto inState = lm->start(0);
-  float total_score = 0, lm_score = 0;
+  float totalScore = 0, lmScore = 0;
   std::vector<float> lmScoreTarget{
       -1.05971, -4.19448, -3.33383, -2.76726, -1.16237, -4.64589};
   for (int i = 0; i < sentence.size(); i++) {
-    auto word = sentence[i];
-    inState = lm->score(inState, lm->index(word), lm_score);
-    ASSERT_NEAR(lm_score, lmScoreTarget[i], 1e-5);
-    total_score += lm_score;
+    const auto& word = sentence[i];
+    std::tie(inState, lmScore) = lm->score(inState, wordDict.getIndex(word));
+    ASSERT_NEAR(lmScore, lmScoreTarget[i], 1e-5);
+    totalScore += lmScore;
   }
-  lm->finish(inState, lm_score);
-  total_score += lm_score;
-  ASSERT_NEAR(total_score, -19.5123, 1e-5);
+  std::tie(inState, lmScore) = lm->finish(inState);
+  totalScore += lmScore;
+  ASSERT_NEAR(totalScore, -19.5123, 1e-5);
 
   /* -------- Build Trie --------*/
-  int sil_idx = tokenDict.getIndex(kSilToken);
-  int blank_idx =
+  int silIdx = tokenDict.getIndex(kSilToken);
+  int blankIdx =
       FLAGS_criterion == kCtcCriterion ? tokenDict.getIndex(kBlankToken) : -1;
-  int unk_idx = lm->index(kUnkToken);
-  auto trie = std::make_shared<Trie>(tokenDict.indexSize(), sil_idx);
-  auto start_state = lm->start(false);
+  int unkIdx = wordDict.getIndex(kUnkToken);
+  auto trie = std::make_shared<Trie>(tokenDict.indexSize(), silIdx);
+  auto startState = lm->start(false);
 
   // Insert words
-  for (auto& it : lexicon) {
-    std::string word = it.first;
-    int lm_idx = lm->index(word);
-    if (lm_idx == unk_idx) {
-      continue;
-    }
-    float score;
-    auto dummy_state = lm->score(start_state, lm_idx, score);
-    for (auto& spelling : it.second) {
-      auto spelling_tensor = tokens2Tensor(spelling, tokenDict);
-      trie->insert(
-          spelling_tensor,
-          std::make_shared<TrieLabel>(lm_idx, wordDict.getIndex(word)),
-          score);
+  for (const auto& it : lexicon) {
+    const std::string& word = it.first;
+    int usrIdx = wordDict.getIndex(word);
+    float score = -1;
+    LMStatePtr dummyState;
+    std::tie(dummyState, score) = lm->score(startState, usrIdx);
+
+    for (const auto& tokens : it.second) {
+      auto tokensTensor = tkn2Idx(tokens, tokenDict, FLAGS_replabel);
+      trie->insert(tokensTensor, usrIdx, score);
     }
   }
   LOG(INFO) << "[Decoder] Trie planted.\n";
@@ -137,33 +148,31 @@ TEST(DecoderTest, run) {
   LOG(INFO) << "[Decoder] Trie smeared.\n";
 
   std::vector<float> trieScoreTarget{
-      -1.05971, -4.41062, -3.67099, -3.06203, -1.05971, -4.29683};
+      -1.05971, -2.87742, -2.64553, -3.05081, -1.05971, -3.08968};
   for (int i = 0; i < sentence.size(); i++) {
     auto word = sentence[i];
-    auto word_tensor = tokens2Tensor(word, tokenDict);
-    auto node = trie->search(word_tensor);
-    ASSERT_NEAR(node->maxScore_, trieScoreTarget[i], 1e-5);
+    auto wordTensor = tokens2Tensor(word, tokenDict);
+    auto node = trie->search(wordTensor);
+    ASSERT_NEAR(node->maxScore, trieScoreTarget[i], 1e-5);
   }
 
   /* -------- Build Decoder --------*/
-  std::shared_ptr<TrieLabel> unk =
-      std::make_shared<TrieLabel>(unk_idx, wordDict.getIndex(kUnkToken));
-  Decoder decoder(trie, lm, sil_idx, blank_idx, unk);
-  LOG(INFO) << "[Decoder] Decoder constructed.\n";
-
-  DecoderOptions decoder_opt(
+  DecoderOptions decoderOpt(
       2500, // FLAGS_beamsize
-      100.0, // FLAGS_beamscore
+      100.0, // FLAGS_beamthreshold
       2.0, // FLAGS_lmweight
       2.0, // FLAGS_lexiconcore
       -std::numeric_limits<float>::infinity(), // FLAGS_unkweight
-      false, // FLAGS_forceendsil
       false, // FLAGS_logadd
       -1, // FLAGS_silweight
-      ModelType::ASG);
+      CriterionType::ASG);
+
+  WordLMDecoder decoder(
+      decoderOpt, trie, lm, silIdx, blankIdx, unkIdx, transitions);
+  LOG(INFO) << "[Decoder] Decoder constructed.\n";
 
   /* -------- Run --------*/
-  auto emission = emission_set.emissions[0];
+  auto emission = emissionSet.emissions[0];
 
   std::vector<float> score;
   std::vector<std::vector<int>> wordPredictions;
@@ -171,18 +180,17 @@ TEST(DecoderTest, run) {
 
   auto timer = fl::TimeMeter();
   timer.resume();
-  std::tie(score, wordPredictions, letterPredictions) =
-      decoder.decode(decoder_opt, transitions.data(), emission.data(), T, N);
+  auto results = decoder.decode(emission.data(), T, N);
   timer.stop();
 
-  int n_hyp = score.size();
+  int n_hyp = results.size();
 
-  ASSERT_EQ(n_hyp, 877);
+  ASSERT_EQ(n_hyp, 1452);
 
   std::vector<float> hypScoreTarget{
-      -338.025, -340.189, -340.415, -340.594, -340.653};
+      -278.111, -278.652, -279.275, -279.847, -280.01};
   for (int i = 0; i < 5; i++) {
-    ASSERT_NEAR(score[i], hypScoreTarget[i], 1e-3);
+    ASSERT_NEAR(results[i].score, hypScoreTarget[i], 1e-3);
   }
 }
 
